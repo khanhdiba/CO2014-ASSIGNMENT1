@@ -133,7 +133,8 @@ CREATE TABLE HMS.Medicine (
 );
 
 CREATE TABLE HMS.Payment_Approach (
-    PAID CHAR(3),    
+    PAID CHAR(3),
+    PAType ENUM ('Cash', 'Bank', 'Ewallet') NOT NULL,
     PRIMARY KEY (PAID)
 );
 
@@ -211,8 +212,8 @@ CREATE TABLE HMS.Performs (
 );
 
 CREATE TABLE HMS.Assists (
-    nurseID	CHAR(7) NOT NULL,
-    treatmentID	INT	NOT NULL,
+    nurseID CHAR(7) NOT NULL,
+    treatmentID INT NOT NULL,
     
     PRIMARY KEY (nurseID, treatmentID),
     FOREIGN KEY (nurseID) REFERENCES Nurse (nurseID),
@@ -220,7 +221,7 @@ CREATE TABLE HMS.Assists (
 );
 
 CREATE TABLE HMS.Takes_care (
-    nurseID	CHAR(7)	NOT NULL,
+    nurseID CHAR(7) NOT NULL,
     roomID CHAR(3) NOT NULL,
     
     PRIMARY KEY (nurseID, roomID),
