@@ -133,8 +133,7 @@ CREATE TABLE HMS.Medicine (
 );
 
 CREATE TABLE HMS.Payment_Approach (
-    PAID CHAR(3),
-    PAType ENUM ('Cash', 'Bank', 'Ewallet') NOT NULL,
+    PAID CHAR(3),    
     PRIMARY KEY (PAID)
 );
 
@@ -212,8 +211,8 @@ CREATE TABLE HMS.Performs (
 );
 
 CREATE TABLE HMS.Assists (
-    nurseID CHAR(7) NOT NULL,
-    treatmentID INT NOT NULL,
+    nurseID	CHAR(7) NOT NULL,
+    treatmentID	INT	NOT NULL,
     
     PRIMARY KEY (nurseID, treatmentID),
     FOREIGN KEY (nurseID) REFERENCES Nurse (nurseID),
@@ -221,7 +220,7 @@ CREATE TABLE HMS.Assists (
 );
 
 CREATE TABLE HMS.Takes_care (
-    nurseID CHAR(7) NOT NULL,
+    nurseID	CHAR(7)	NOT NULL,
     roomID CHAR(3) NOT NULL,
     
     PRIMARY KEY (nurseID, roomID),
@@ -293,3 +292,290 @@ GRANT SELECT ON HMS.Prescribes_View TO 'patient_role';
 GRANT SELECT ON HMS.Bill_View TO 'patient_role';
 
 FLUSH PRIVILEGES;
+
+
+
+-- FUNCTION
+
+DELIMITER $$
+
+CREATE FUNCTION HMS.GetPatientCountAtRoom(roomIDInput CHAR(3))
+RETURNS INT
+DETERMINISTIC
+BEGIN
+    DECLARE patientCount INT;
+
+    -- Calculate the number of patients currently in the room
+    SELECT 
+        COUNT(patientID) 
+    INTO 
+        patientCount
+    FROM 
+        HMS.Admitted_to
+    WHERE 
+        roomID = roomIDInput 
+        AND admittedDate <= NOW()
+        AND (dischargedDate > NOW() OR dischargedDate IS NULL);
+
+    RETURN patientCount;
+END$$
+
+DELIMITER ;
+
+-- PROCEDURE
+
+DELIMITER $$
+
+CREATE PROCEDURE HMS.GetPatientCountAllRoomAtDate(atDate DATE)
+BEGIN
+    SELECT 
+        roomID, 
+        COUNT(patientID) AS patientCount
+    FROM HMS.Admitted_to
+    WHERE admittedDate <= atDate 
+      AND (dischargedDate > atDate OR dischargedDate IS NULL)
+    GROUP BY roomID;
+END$$
+
+DELIMITER ;
+
+-- TRIGGER
+
+DELIMITER $$
+
+CREATE TRIGGER HMS.CheckRoomCapacity
+BEFORE INSERT ON HMS.Admitted_to
+FOR EACH ROW
+BEGIN
+    DECLARE currentCount INT;
+    DECLARE roomCapacity INT;
+
+    -- Get the current number of patients in the room
+    SELECT COUNT(patientID)
+    INTO currentCount
+    FROM HMS.Admitted_to
+    WHERE roomID = NEW.roomID 
+      AND admittedDate <= NEW.admittedDate 
+      AND (dischargedDate > NEW.admittedDate OR dischargedDate IS NULL);
+
+    -- Get the room's capacity
+    SELECT capacity
+    INTO roomCapacity
+    FROM HMS.Room
+    WHERE roomID = NEW.roomID;
+
+    -- Check if adding the new patient exceeds the capacity
+    IF currentCount >= roomCapacity THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Room capacity exceeded';
+    END IF;
+END$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE TRIGGER HMS.EnsurePatientAvailability
+BEFORE INSERT ON HMS.Appointment
+FOR EACH ROW
+BEGIN
+    DECLARE overlappingAppointments INT;
+
+    -- Check if there are any overlapping appointments for the patient
+    SELECT 
+        COUNT(*)
+    INTO 
+        overlappingAppointments
+    FROM 
+        HMS.Appointment
+    WHERE 
+        patientID = NEW.patientID
+        AND appointmentDate = NEW.appointmentDate
+        AND (
+            (NEW.appointmentTime BETWEEN appointmentTime AND ADDTIME(appointmentTime, '00:30:00'))
+            OR (appointmentTime BETWEEN NEW.appointmentTime AND ADDTIME(NEW.appointmentTime, '00:30:00'))
+        );
+
+    -- If overlapping appointments exist, raise an error
+    IF overlappingAppointments > 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Patient is already scheduled for another appointment at this time';
+    END IF;
+END$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE TRIGGER HMS.EnsureUniqueRoomForPatient
+BEFORE INSERT ON HMS.Admitted_to
+FOR EACH ROW
+BEGIN
+    DECLARE overlappingAdmissions INT;
+
+    -- Check if the patient is already admitted to another room during the new admission period
+    SELECT 
+        COUNT(*)
+    INTO 
+        overlappingAdmissions
+    FROM 
+        HMS.Admitted_to
+    WHERE 
+        patientID = NEW.patientID
+        AND (
+            (NEW.admittedDate BETWEEN admittedDate AND IFNULL(dischargedDate, NOW())) -- Overlap with an existing admission
+            OR (admittedDate BETWEEN NEW.admittedDate AND IFNULL(NEW.dischargedDate, NOW()))
+        );
+
+    -- If overlapping admissions exist, raise an error
+    IF overlappingAdmissions > 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Patient is already admitted to another room during this time period';
+    END IF;
+END$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE TRIGGER HMS.EnsureNurseAssignedToAdjacentRooms
+BEFORE INSERT ON HMS.Takes_care
+FOR EACH ROW
+BEGIN
+    DECLARE room1 CHAR(3);
+    DECLARE room2 CHAR(3);
+    DECLARE roomCount INT;
+
+    -- Check how many rooms the nurse is already assigned to
+    SELECT 
+        COUNT(*)
+    INTO 
+        roomCount
+    FROM 
+        HMS.Takes_care
+    WHERE 
+        nurseID = NEW.nurseID;
+
+    -- If nurse is assigned to two rooms, validate adjacency
+    IF roomCount = 2 THEN
+        SELECT 
+            GROUP_CONCAT(roomID ORDER BY roomID)
+        INTO 
+            @assignedRooms
+        FROM 
+            HMS.Takes_care
+        WHERE 
+            nurseID = NEW.nurseID;
+
+        SET room1 = SUBSTRING_INDEX(@assignedRooms, ',', 1);
+        SET room2 = SUBSTRING_INDEX(@assignedRooms, ',', -1);
+
+        -- Check if the new room is adjacent to both existing rooms
+        IF NOT (ABS(NEW.roomID - room1) = 1 OR ABS(NEW.roomID - room2) = 1) THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Nurse can only be assigned to two adjacent rooms';
+        END IF;
+    END IF;
+END$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE TRIGGER HMS.EnsureNurseAssignedToOccupiedRoom
+AFTER INSERT ON HMS.Admitted_to
+FOR EACH ROW
+BEGIN
+    DECLARE nurseCount INT;
+
+    -- Check if there is at least one nurse assigned to the room
+    SELECT 
+        COUNT(*)
+    INTO 
+        nurseCount
+    FROM 
+        HMS.Takes_care
+    WHERE 
+        roomID = NEW.roomID;
+
+    -- If no nurses are assigned to the room, raise an error
+    IF nurseCount = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'No nurse assigned to this room with admitted patients';
+    END IF;
+END$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE TRIGGER HMS.EnsureNurseAssignedToOccupiedRoomAfterDelete
+AFTER DELETE ON HMS.Admitted_to
+FOR EACH ROW
+BEGIN
+    DECLARE remainingPatients INT;
+    DECLARE nurseCount INT;
+
+    -- Check if there are any remaining patients in the room
+    SELECT 
+        COUNT(*)
+    INTO 
+        remainingPatients
+    FROM 
+        HMS.Admitted_to
+    WHERE 
+        roomID = OLD.roomID;
+
+    -- If there are still patients in the room, check nurse assignments
+    IF remainingPatients > 0 THEN
+        SELECT 
+            COUNT(*)
+        INTO 
+            nurseCount
+        FROM 
+            HMS.Takes_care
+        WHERE 
+            roomID = OLD.roomID;
+
+        -- If no nurses are assigned, raise an error
+        IF nurseCount = 0 THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'No nurse assigned to this room with admitted patients';
+        END IF;
+    END IF;
+END$$
+
+DELIMITER ;
+
+DELIMITER $$
+
+CREATE TRIGGER HMS.EnsureDoctorAvailability
+BEFORE INSERT ON HMS.Appointment
+FOR EACH ROW
+BEGIN
+    DECLARE conflictingCount INT;
+
+    -- Check if the doctor already has an overlapping appointment
+    SELECT 
+        COUNT(*)
+    INTO 
+        conflictingCount
+    FROM 
+        HMS.Appointment
+    WHERE 
+        doctorID = NEW.doctorID
+        AND appointmentDate = NEW.appointmentDate
+        AND (
+            (NEW.appointmentTime >= appointmentTime AND NEW.appointmentTime < ADDTIME(appointmentTime, '00:10:00')) 
+            OR 
+            (ADDTIME(NEW.appointmentTime, '00:10:00') > appointmentTime AND ADDTIME(NEW.appointmentTime, '00:10:00') <= ADDTIME(appointmentTime, '00:10:00'))
+        );
+
+    -- If there is a conflict, raise an error
+    IF conflictingCount > 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'A doctor can be scheduled for at most one appointment every 10 minutes.';
+    END IF;
+END$$
+
+DELIMITER ;
